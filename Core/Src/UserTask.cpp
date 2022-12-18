@@ -57,52 +57,97 @@ struct PID
     float dt = 0.001f;
 };
 
+static volatile float lim_max = 16384;
+static volatile float lim_min = -16384;
+
+static volatile bool rotate_valid;
 static volatile float targetPos = 0;
+
+void rotate_position(DJIMotor::DJIMotor &motor, PID &pid, float targetPos)
+{
+    //if (rotate_valid == false)
+    //{
+    //    motor.setOutputCurrent(0);
+    //    return;
+    //}
+
+    float lastPos;
+    static float Pos;
+    float lim_min_integ;
+    float lim_max_integ;
+
+    lastPos = Pos;
+    Pos = motor.getPosition();
+    pid.error = targetPos - Pos;
+    pid.pout = pid.Kp * pid.error;
+    pid.integral += pid.Ki * pid.error * pid.dt;
+    pid.iout = pid.integral;
+    pid.dout = pid.Kd * (Pos - lastPos) / pid.dt;  // solve derivative kick
+    // Anti-wind-up via Dynamic Integrator Clamping
+    // Limits Computationa and Application
+    if (lim_max > pid.pout)
+        lim_max_integ = lim_max - pid.pout;
+    else
+        lim_max_integ = 0.0f;
+    if (lim_min < pid.pout)
+        lim_min_integ = lim_min - pid.pout;
+    else
+        lim_min_integ = 0.0f;
+
+    // Constrain Integrator
+    if (pid.iout > lim_max_integ)
+        pid.iout = lim_max_integ;
+    else if (pid.iout < lim_min_integ)
+        pid.iout = lim_min_integ;
+
+    pid.out = pid.pout + pid.iout + pid.dout;
+    if (pid.out < lim_min)
+        pid.out = lim_min;
+    else if (pid.out > lim_max)
+        pid.out = lim_max;
+    motor.setOutputCurrent(pid.out);
+}
+
 
 StackType_t uxPIDTaskStack[128];
 StaticTask_t xPIDTaskTCB;
 void PIDTask(void *pvPara)
 {
-    DJIMotor::DJIMotor &motor = DJIMotor::getMotor(0x205);
-    motor.setCurrentLimit(30000);
-    static volatile PID pid;
+    // get and init the motors
+    DJIMotor::DJIMotor &motor = DJIMotor::getMotor(0x201);
+    motor.setCurrentLimit(16383);
+
+    // set the parameter of pid
+    static volatile PID pid_set;
+
+    // the pid of the motor, will be past by reference to the function
+    PID pid;
+
+    // used to watch the behavior of the motors
+    static volatile float curPos;
 
     while (true)
     {
-        pid.lastError = pid.error;
-        pid.error = targetPos - motor.getPosition();
+        pid.Kd = pid_set.Kd;
+        pid.Kp = pid_set.Kp;
+        pid.Ki = pid_set.Ki;
 
-        pid.pout = pid.Kp * pid.error;
+        curPos = motor.getPosition();
+        float Pos = targetPos;
+        rotate_position(motor, pid, Pos);
+        DJIMotor::sendMotorGroup(0);
 
-        pid.integral += pid.Ki * pid.error * pid.dt;
-        pid.iout = pid.integral;
-
-        pid.dout = pid.Kd * (pid.error - pid.lastError) / pid.dt;
-
-        pid.out = pid.pout + pid.iout + pid.dout;
-
-        motor.setOutputCurrent(pid.out);
-        DJIMotor::sendMotorGroup(1);
-        vTaskDelay((uint32_t)(pid.dt * 1000) == 0? 1: (uint32_t)(pid.dt * 1000));
+        vTaskDelay((uint32_t)(pid_set.dt * 1000) == 0 ? 1 : (uint32_t)(pid_set.dt * 1000));
     }
 }
 
-static volatile float step = 1;
 StackType_t uxTargetUpdateTaskStack[128];
 StaticTask_t xTargetUpdateTaskTCB;
 void TargetUpdateTask(void *pvPara)
 {
     while (true)
     {
-        while (DR16::getRcData().rc.ch3 - 1024 <= -200 || DR16::getRcData().rc.ch3 - 1024 >= 200)
-            vTaskDelay(1);
-        while (DR16::getRcData().rc.ch3 - 1024 > -200 && DR16::getRcData().rc.ch3 - 1024 < 200)
-            vTaskDelay(1);
-        if (DR16::getRcData().rc.ch3 - 1024 > 0)
-            targetPos += step;
-        else
-            targetPos -= step;
-        vTaskDelay(1);
+        
     }
 }
 
@@ -117,4 +162,3 @@ void startUserTasks()
     xTaskCreateStatic(PIDTask, "PID", 128, NULL, 10, uxPIDTaskStack, &xPIDTaskTCB);
     xTaskCreateStatic(TargetUpdateTask, "TargetUpdate", 128, NULL, 10, uxTargetUpdateTaskStack, &xTargetUpdateTaskTCB);
 }
-
